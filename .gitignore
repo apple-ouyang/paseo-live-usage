@@ -1,0 +1,3 @@
+node_modules/
+# Machine-local registry URLs end up in the lockfile; package.json pins the SDK exactly.
+package-lock.json
