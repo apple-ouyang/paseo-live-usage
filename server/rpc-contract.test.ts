@@ -31,8 +31,6 @@ async function roundTrip(
   const snapshot = collectUsage("test-agent", {
     provider,
     sessionId,
-    cwd: null,
-    model: "deepseek-flash",
     lastUsage: null,
     home,
   });
@@ -138,6 +136,16 @@ test("没有逐 token 计时的 provider：speed/turnSpeed 过 schema 后是 und
           content: [{ type: "text", text: "ok" }],
         },
       },
+      // Claude Code appends session-cumulative cost rows carrying the real USD
+      // cost; that is the only cost source this plugin will report.
+      {
+        type: "cost-state",
+        sessionId,
+        totalCostUSD: 0.22049159999999998,
+        totalAPIDuration: 27_726,
+        totalToolDuration: 0,
+        modelUsage: { "claude-opus-5-5": { outputTokens: 1_171, thinkingTokens: 367 } },
+      },
     ];
     writeFileSync(
       join(dir, `${sessionId}.jsonl`),
@@ -151,8 +159,39 @@ test("没有逐 token 计时的 provider：speed/turnSpeed 过 schema 后是 und
     // so it must not be coalesced to null anywhere along the way.
     assert.equal(parsed.speed, undefined);
     assert.equal(parsed.turnSpeed, undefined);
+    assert.deepEqual(parsed.cost, { value: 0.22049159999999998, currency: "USD" });
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("没有成本字段的会话不给花费，也不拿价目表算一个", async () => {
+  const s = newSession();
+  try {
+    writeFileSync(
+      s.path,
+      s.frame([
+        s.event("turn/start", T0, { turn: 1 }),
+        ...step(s, {
+          turn: 1,
+          step: 1,
+          output: 100,
+          startAt: T0,
+          firstChunkAt: T0,
+          endAt: T0 + 1_000,
+        }),
+        s.event("turn/end", T0 + 1_000, { turn: 1 }),
+      ]),
+    );
+
+    const parsed = await roundTrip(s.home, "dsh", s.sessionId);
+    assert.equal(parsed.source, "dsh-log");
+    assert.ok(parsed.totals);
+    // dsh's log has no cost field. The panel shows nothing rather than a number
+    // derived from a price table, so this must stay null.
+    assert.equal(parsed.cost, null);
+  } finally {
+    s.cleanup();
   }
 });
 

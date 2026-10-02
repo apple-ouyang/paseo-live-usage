@@ -65,12 +65,10 @@ export interface ContextMetrics {
   pressure: number | null;
 }
 
+/** Cost as the provider itself reports it. Never derived from a price table. */
 export interface CostMetrics {
   value: number;
   currency: "USD" | "CNY";
-  estimated: boolean;
-  /** DeepSeek peak/off-peak window; null for provider-reported USD cost. */
-  peak: boolean | null;
 }
 
 export interface TimingMetrics {
@@ -216,8 +214,6 @@ export interface LastUsageLike {
 export interface CollectInput {
   provider: string | null;
   sessionId: string | null;
-  cwd: string | null;
-  model: string | null;
   lastUsage: LastUsageLike | null;
   /** Paseo says the agent is running; used by the fallback adapter only. */
   running?: boolean;
@@ -262,62 +258,6 @@ function makeTotals(
   reasoning = 0,
 ): TotalsMetrics {
   return { input, cacheRead, cacheWrite, output, reasoning, hitPct: hitRate(input, cacheRead, cacheWrite) };
-}
-
-/* ────────────────────────────── pricing ────────────────────────────── */
-
-/** DeepSeek CNY list prices (元 / 1M tokens); peak = 2× off-peak. */
-const FLASH = { offPeak: { hit: 0.02, miss: 1, out: 4 }, peak: { hit: 0.04, miss: 2, out: 8 } };
-const PRO = { offPeak: { hit: 0.15, miss: 4.5, out: 13.5 }, peak: { hit: 0.3, miss: 9, out: 27 } };
-const WEEKEND_OFFPEAK_SINCE = Date.parse("2026-08-22T16:00:00Z");
-
-function priceFor(model: string | null): { offPeak: typeof FLASH.offPeak; peak: typeof FLASH.peak } | null {
-  if (!model) return null;
-  const id = model.toLowerCase();
-  if (!id.includes("deepseek")) return null;
-  if (id.includes("flash")) return FLASH;
-  if (id.includes("pro")) return PRO;
-  return null;
-}
-
-function isPeak(atMs: number): boolean {
-  const beijing = new Date(atMs + 8 * 3600_000);
-  const day = beijing.getUTCDay();
-  if (atMs >= WEEKEND_OFFPEAK_SINCE && (day === 0 || day === 6)) return false;
-  const minutes = beijing.getUTCHours() * 60 + beijing.getUTCMinutes();
-  return (minutes >= 9 * 60 && minutes < 12 * 60) || (minutes >= 14 * 60 && minutes < 18 * 60);
-}
-
-function estimateCny(
-  model: string | null,
-  input: number,
-  cacheRead: number,
-  output: number,
-  atMs: number,
-): number | null {
-  const price = priceFor(model);
-  if (!price) return null;
-  const rate = isPeak(atMs) ? price.peak : price.offPeak;
-  const value = (cacheRead * rate.hit + input * rate.miss + output * rate.out) / 1_000_000;
-  return value > 0 ? value : null;
-}
-
-/** dsh stores the model as a JSON array string, e.g. `["deepseek-official","deepseek-flash"]`. */
-function normalizeModel(model: string | null): string | null {
-  if (!model) return null;
-  const trimmed = model.trim();
-  if (trimmed.startsWith("[")) {
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (Array.isArray(parsed)) {
-        const last = [...parsed].reverse().find((item) => typeof item === "string");
-        if (typeof last === "string") return last;
-      }
-    } catch {
-      // fall through to the raw value
-    }
-  }
-  return trimmed;
 }
 
 /* ────────────────────────────── helpers ────────────────────────────── */
@@ -370,12 +310,9 @@ function newestMtime(path: string): number {
 
 /* ────────────────────────────── dsh ────────────────────────────── */
 
-function dshSnapshot(sessionId: string, model: string | null, home: string): UsageSnapshot | null {
+function dshSnapshot(sessionId: string, home: string): UsageSnapshot | null {
   const raw = readDshUsage(sessionId, home);
   if (!raw) return null;
-  const estimate = raw.totals
-    ? estimateCny(model, raw.totals.input, raw.totals.cacheRead, raw.totals.output, raw.observedAt)
-    : null;
   return {
     source: "dsh-log",
     sourceAgeMs: raw.sourceAgeMs,
@@ -397,10 +334,9 @@ function dshSnapshot(sessionId: string, model: string | null, home: string): Usa
       : null,
     totals: raw.totals,
     context: raw.context,
-    cost:
-      estimate !== null
-        ? { value: estimate, currency: "CNY", estimated: true, peak: isPeak(raw.observedAt) }
-        : null,
+    // dsh's session store carries no cost field, and this plugin does not invent
+    // one from a price table.
+    cost: null,
     timing: raw.timing,
     turnSpeed: raw.turnSpeed,
     speed: raw.speed,
@@ -531,7 +467,7 @@ function piSnapshot(path: string, sessionId: string, home: string, now: number):
     context: null,
     cost:
       state.costUsd > 0
-        ? { value: state.costUsd, currency: "USD", estimated: false, peak: null }
+        ? { value: state.costUsd, currency: "USD" }
         : null,
     timing,
     speed: phaseSpeed(phase, { turns: state.turns, steps: state.steps, toolMs: timing.toolMs }),
@@ -599,6 +535,8 @@ interface ClaudeState {
   /** Outstanding tool_use blocks; the turn is open while this is > 0. */
   pendingToolCalls: number;
   timing: TimingMetrics;
+  /** Latest `cost-state.totalCostUSD` Claude Code wrote for this session. */
+  costUsd: number;
   changeAt: number;
 }
 
@@ -639,6 +577,7 @@ function claudeSnapshot(path: string, now: number): UsageSnapshot {
       inTurn: false,
       pendingToolCalls: 0,
       timing: emptyTiming(),
+      costUsd: 0,
       changeAt: now,
     };
     claudeStates.set(path, state);
@@ -677,6 +616,16 @@ function claudeSnapshot(path: string, now: number): UsageSnapshot {
       if (at !== null) state.prevAt = at;
       continue;
     }
+    // Claude Code appends session-cumulative `cost-state` rows carrying the real
+    // USD cost. Keep the highest seen (it only grows).
+    if (type === "cost-state") {
+      const total = line.totalCostUSD;
+      if (typeof total === "number" && Number.isFinite(total) && total > state.costUsd) {
+        state.costUsd = total;
+      }
+      continue;
+    }
+
     if (type !== "assistant" || !message?.usage) {
       // Bookkeeping entries (queue-operation, attachment, progress, last-prompt, mode…)
       // are written both mid-turn and between turns, and their gap is never provably
@@ -754,7 +703,7 @@ function claudeSnapshot(path: string, now: number): UsageSnapshot {
     last: state.last,
     totals: state.totals.output > 0 || state.totals.input > 0 ? state.totals : null,
     context: null,
-    cost: null,
+    cost: state.costUsd > 0 ? { value: state.costUsd, currency: "USD" } : null,
     timing: finalizeTiming(state.timing),
   };
 }
@@ -1035,7 +984,7 @@ function passthroughSnapshot(agentId: string, input: CollectInput, now: number):
       contextUsed !== null && contextMax !== null
         ? { used: contextUsed, window: contextMax, pressure: null }
         : null,
-    cost: cost !== null && cost > 0 ? { value: cost, currency: "USD", estimated: false, peak: null } : null,
+    cost: cost !== null && cost > 0 ? { value: cost, currency: "USD" } : null,
     timing: null,
   };
 }
@@ -1066,7 +1015,7 @@ function withContextFallback(snapshot: UsageSnapshot, input: CollectInput): Usag
   }
   if (snapshot.cost === null) {
     const cost = optionalNumber(input.lastUsage?.totalCostUsd);
-    if (cost !== null && cost > 0) snapshot.cost = { value: cost, currency: "USD", estimated: false, peak: null };
+    if (cost !== null && cost > 0) snapshot.cost = { value: cost, currency: "USD" };
   }
   // Paseo's running flag is authoritative when present: it clears the stuck
   // "in flight" state a file tail can leave behind after a crash/abort, and it
@@ -1078,10 +1027,9 @@ function withContextFallback(snapshot: UsageSnapshot, input: CollectInput): Usag
 export function collectUsage(agentId: string, input: CollectInput): UsageSnapshot | null {
   const home = input.home ?? homedir();
   const now = Date.now();
-  const model = normalizeModel(input.model);
 
   if (input.provider === "dsh" && input.sessionId) {
-    const snapshot = dshSnapshot(input.sessionId, model, home);
+    const snapshot = dshSnapshot(input.sessionId, home);
     if (snapshot) return withContextFallback(snapshot, input);
   }
 

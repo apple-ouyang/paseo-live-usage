@@ -95,12 +95,10 @@ const TimingSchema = z.object({
   otherMs: z.number(),
 });
 
+/** Cost exactly as the provider reports it; this plugin never derives one. */
 const CostSchema = z.object({
   value: z.number(),
   currency: z.enum(["USD", "CNY"]),
-  estimated: z.boolean(),
-  /** DeepSeek peak/off-peak pricing window; null when the provider reports cost in USD. */
-  peak: z.boolean().nullable(),
 });
 
 const SupportedSchema = z.object({

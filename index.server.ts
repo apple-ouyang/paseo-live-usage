@@ -7,8 +7,6 @@ import { toUsagePayload } from "./server/payload.ts";
 interface ResolvedTarget {
   provider: string | null;
   sessionId: string | null;
-  cwd: string | null;
-  model: string | null;
   lastUsage: LastUsageLike | null;
   running: boolean;
 }
@@ -37,8 +35,6 @@ async function resolveTarget(
   return {
     provider: agent?.provider ?? handle.runtimeInfo?.provider ?? known.provider ?? null,
     sessionId: handle.runtimeInfo?.sessionId ?? known.sessionId ?? null,
-    cwd: handle.cwd ?? agent?.cwd ?? null,
-    model: agent?.runtimeInfo?.model ?? handle.runtimeInfo?.model ?? null,
     lastUsage: (handle.lastUsage ?? agent?.lastUsage ?? null) as LastUsageLike | null,
     running: agent?.status === "running" || agent?.activeTurn != null,
   };
@@ -55,8 +51,6 @@ export default function contribute(server: PluginServerContext) {
       const snapshot = collectUsage(input.agentId, {
         provider: target.provider,
         sessionId: target.sessionId,
-        cwd: target.cwd,
-        model: target.model,
         lastUsage: target.lastUsage,
         running: target.running,
       });

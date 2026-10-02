@@ -2,38 +2,18 @@ import { usePaseo } from "@getpaseo/plugin/client";
 import type { PaseoAgentTimelineEvent, PaseoApi } from "@getpaseo/client";
 import { useEffect, useState } from "react";
 
-/** Sum of the completed turns this client observed, for thread-level ratios. */
-export interface TurnHistory {
-  turns: number;
-  /** Σ measured; turns whose start event was missed contribute only think/out. */
-  waitMs: number;
-  thinkMs: number;
-  outMs: number;
-}
-
 /** Mirrors the pi statusline's "本轮" row: live wait / think / output / tool. */
 export interface LiveTurnClock {
   running: boolean;
   /**
    * Time from submit to the first streamed chunk. Null when the turn start
-   * event was missed (pill mounted mid-turn) and the wait cannot be measured —
-   * "unknown" is not 0, and the thread-level split must not read it as 0.
+   * event was missed (pill mounted mid-turn) and the wait cannot be measured:
+   * "unknown" must render as `–`, never as 0.
    */
   waitMs: number | null;
   thinkMs: number;
   outMs: number;
   toolMs: number;
-  /**
-   * dsh's own live decode rate, same definition as the badge in `dsh-tui`:
-   * estimated tokens ÷ generation wall clock (think + out phases only). Tool
-   * execution and the wait for the first token sit in neither side, so a slow
-   * tool or a long TTFT cannot drag it down. Null until the generation window
-   * reaches MIN_SAMPLE_MS.
-   */
-  liveTps: number | null;
-  /** Estimated VISIBLE output tokens (reasoning excluded) in the current turn. */
-  liveTokens: number;
-  history: TurnHistory;
 }
 
 interface ClockState {
@@ -46,35 +26,10 @@ interface ClockState {
   outMs: number;
   /** Null = turn start missed, wait unmeasured. */
   waitMs: number | null;
-  /** Set once the finished turn was folded into `history`. */
-  foldedTurn: boolean;
-  history: TurnHistory;
   toolActive: Set<string>;
   toolStartedAt: number | null;
   toolMs: number;
-  /** All streamed characters (thinking + visible), for the decode-rate estimate. */
-  streamedChars: number;
-  /** Visible output characters only, for the "流出" row. */
-  outChars: number;
-  lastText: { reasoning: string; assistant_message: string };
 }
-
-/**
- * dsh-tui's own live estimator is a flat four characters per token
- * (`pi-nano-context` in channel/usage.js). Matching it keeps this preview on
- * the same scale as the settled file value instead of inventing a second one.
- */
-function estimateTokens(chars: number): number {
-  return Math.ceil(chars / 4);
-}
-
-/**
- * A live rate needs a real sample. dsh's own badge starts at the first
- * character, so a 0.25s window holding one character reads as "4 t/s"; the
- * panel must not flash that at the start of every turn.
- */
-const MIN_LIVE_MS = 1_000;
-const MIN_LIVE_TOKENS = 8;
 
 function createState(): ClockState {
   return {
@@ -86,14 +41,9 @@ function createState(): ClockState {
     thinkMs: 0,
     outMs: 0,
     waitMs: null,
-    foldedTurn: false,
-    history: { turns: 0, waitMs: 0, thinkMs: 0, outMs: 0 },
     toolActive: new Set(),
     toolStartedAt: null,
     toolMs: 0,
-    streamedChars: 0,
-    outChars: 0,
-    lastText: { reasoning: "", assistant_message: "" },
   };
 }
 
@@ -143,42 +93,10 @@ function resetTurn(state: ClockState): void {
   state.thinkMs = 0;
   state.outMs = 0;
   state.waitMs = null;
-  state.foldedTurn = false;
   state.toolActive.clear();
   state.toolStartedAt = null;
   state.toolMs = 0;
   state.firstDeltaAt = null;
-  state.streamedChars = 0;
-  state.outChars = 0;
-  state.lastText = { reasoning: "", assistant_message: "" };
-}
-
-/** Fold one finished turn into the per-agent history (survives resetTurn). */
-function foldTurn(state: ClockState): void {
-  if (state.foldedTurn) return;
-  state.foldedTurn = true;
-  if (state.waitMs === null && state.thinkMs === 0 && state.outMs === 0) return;
-  state.history.turns += 1;
-  state.history.waitMs += state.waitMs ?? 0;
-  state.history.thinkMs += state.thinkMs;
-  state.history.outMs += state.outMs;
-}
-
-function addStreamedText(
-  state: ClockState,
-  type: "reasoning" | "assistant_message",
-  text: string,
-): void {
-  if (!text) return;
-  const previous = state.lastText[type];
-  const delta = text === previous ? "" : text.startsWith(previous) ? text.slice(previous.length) : text;
-  state.lastText[type] = text;
-  if (!delta) return;
-  // Both phases stream tokens, so the decode-rate estimate counts both; the
-  // "流出" row is about what the user receives and must not count thinking text.
-  const chars = delta.length;
-  state.streamedChars += chars;
-  if (type === "assistant_message") state.outChars += chars;
 }
 
 /** Structural view of the daemon's stream envelope; avoids a protocol type import. */
@@ -211,7 +129,6 @@ function applyEvent(state: ClockState, raw: PaseoAgentTimelineEvent, now: number
       if (state.firstDeltaAt === null && state.ttftAnchor !== null) {
         state.waitMs = Math.max(0, now - state.ttftAnchor);
       }
-      foldTurn(state);
       state.running = false;
       state.ttftAnchor = null;
       return;
@@ -229,13 +146,11 @@ function applyEvent(state: ClockState, raw: PaseoAgentTimelineEvent, now: number
       }
       if (item.type === "assistant_message") {
         onFirstDelta(state, now);
-        addStreamedText(state, "assistant_message", item.text ?? "");
         switchPhase(state, "out", now);
         return;
       }
       if (item.type === "reasoning") {
         onFirstDelta(state, now);
-        addStreamedText(state, "reasoning", item.text ?? "");
         switchPhase(state, "think", now);
         return;
       }
@@ -270,21 +185,12 @@ function snapshot(state: ClockState, now: number): LiveTurnClock {
   const toolMs =
     state.toolMs +
     (state.toolActive.size > 0 && state.toolStartedAt !== null ? now - state.toolStartedAt : 0);
-  const generationMs = thinkMs + outMs;
-  const estimatedTokens = estimateTokens(state.streamedChars);
-  const liveTps =
-    generationMs >= MIN_LIVE_MS && estimatedTokens >= MIN_LIVE_TOKENS
-      ? estimatedTokens / (generationMs / 1000)
-      : null;
   return {
     running: state.running,
     waitMs,
     thinkMs,
     outMs,
     toolMs,
-    liveTps,
-    liveTokens: estimateTokens(state.outChars),
-    history: { ...state.history },
   };
 }
 
@@ -339,9 +245,6 @@ function read(agentId: string): LiveTurnClock {
         thinkMs: 0,
         outMs: 0,
         toolMs: 0,
-        liveTps: null,
-        liveTokens: 0,
-        history: { turns: 0, waitMs: 0, thinkMs: 0, outMs: 0 },
       };
 }
 
