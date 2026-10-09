@@ -2,6 +2,6 @@
   "id": "live-usage",
   "description": "Live decode speed, cache-hit rate, phase timings and cost per agent, shown as a composer pill (dsh, pi, claude, codex, plus a Paseo lastUsage fallback).",
   "requirements": {
-    "paseo": ">=0.9.1 <0.11.0"
+    "paseo": ">=0.9.1 <0.12.0"
   }
 }
