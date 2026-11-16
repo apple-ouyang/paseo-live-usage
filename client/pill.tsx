@@ -9,25 +9,9 @@ import type { ComponentType } from "react";
 import { useEffect } from "react";
 import { Text, View } from "react-native";
 import type { LiveUsageResult, LiveUsageSupported } from "../shared/rpc.ts";
-import { fmtClock, fmtCost, fmtDur, fmtHit, fmtSec, fmtTps } from "./format.ts";
+import { fmtClock, fmtCost, fmtDur, fmtHit, fmtSec, fmtTokens, fmtTps, pillLabel } from "./format.ts";
 import { useLiveUsage } from "./use-live-usage.ts";
 import { useTurnClock, type LiveTurnClock } from "./use-turn-clock.ts";
-
-/** Label shown inside the composer pill, next to the icon. */
-export function pillLabel(data: LiveUsageResult | undefined): string {
-  if (!data) return "…";
-  if (!data.supported) return "–";
-  const parts: string[] = [];
-  // Only measured rates ever reach the label.
-  const tps = data.turnSpeed?.tokensPerSecond ?? data.last?.tokensPerSecond ?? null;
-  if (tps !== null && tps > 0) parts.push(`${fmtTps(tps)} t/s`);
-  const hit = fmtHit(data.last?.hitPct ?? data.totals?.hitPct ?? null);
-  if (hit !== null) parts.push(`${hit}%`);
-  if (parts.length === 0 && data.context) {
-    parts.push(`${Math.round((data.context.used / data.context.window) * 100)}% ctx`);
-  }
-  return parts.length > 0 ? parts.join(" · ") : "–";
-}
 
 function hitColor(theme: PluginTheme, hit: number | null): string {
   if (hit === null) return theme.colors.foregroundMuted;
@@ -79,14 +63,16 @@ function Row({
 
 function phaseLine(
   waitMs: number | null,
-  thinkMs: number,
-  outMs: number,
+  thinkMs: number | null,
+  outMs: number | null,
   toolMs: number,
   format: (ms: number) => string,
 ): string {
-  // null = the turn start event was missed and the wait was never measurable.
-  const wait = waitMs === null ? "–" : format(waitMs);
-  return `等待 ${wait} · 思考 ${format(thinkMs)} · 输出 ${format(outMs)} · 工具 ${format(
+  // null = that phase was never observed (the turn start or the phase itself
+  // happened before the subscription attached): show `–`, never a 0 it did not
+  // measure.
+  const shown = (ms: number | null) => (ms === null ? "–" : format(ms));
+  return `等待 ${shown(waitMs)} · 思考 ${shown(thinkMs)} · 输出 ${shown(outMs)} · 工具 ${format(
     toolMs,
   )}`;
 }
@@ -122,12 +108,24 @@ function Details({
   // This turn goes FIRST: it is what the user is watching right now. Every value
   // is wall clock measured from the timeline stream.
   const hasLiveTurn =
-    clock.running || (clock.waitMs ?? 0) + clock.thinkMs + clock.outMs + clock.toolMs > 0;
+    clock.running ||
+    (clock.waitMs ?? 0) + (clock.thinkMs ?? 0) + (clock.outMs ?? 0) + clock.toolMs > 0;
   if (hasLiveTurn) {
     rows.push({
       label: "本轮",
       value: phaseLine(clock.waitMs, clock.thinkMs, clock.outMs, clock.toolMs, fmtSec),
     });
+  }
+
+  // The pill's numbers, spelled out: the newest call the store sampled. pi's
+  // statusline stamps every call, so this is the same rate the label shows.
+  const latest = speed?.latest ?? null;
+  if (latest != null) {
+    const bits: string[] = [];
+    if (latest.tokensPerSecond !== null) bits.push(`${fmtTps(latest.tokensPerSecond)} t/s`);
+    bits.push(`首字 ${fmtSec(latest.ttftMs)}`, `输出 ${fmtTokens(latest.output)} tok`);
+    if (latest.at !== null) bits.push(fmtClock(latest.at));
+    rows.push({ label: "最近", value: bits.join(" · ") });
   }
 
   // Rates. `speed` carries the measured per-turn and whole-session rates, which
@@ -170,7 +168,9 @@ function Details({
 
   // Usage row: rounds/steps only exist where the store counts them.
   const usage: string[] = [];
-  if (speed != null && speed.turns > 0) usage.push(`${speed.turns}轮${speed.steps}步`);
+  const turns = speed != null && speed.turns > 0 ? speed.turns : data.totals?.turns;
+  const steps = speed != null && speed.turns > 0 ? speed.steps : data.totals?.steps;
+  if (turns != null || steps != null) usage.push(`${turns ?? 0}轮${steps ?? "?"}步`);
   if (hit !== null) usage.push(`命中 ${hit}`);
   if (cost !== null) usage.push(cost);
   if (last) usage.push(`结束 ${fmtClock(last.endedAt)}`);

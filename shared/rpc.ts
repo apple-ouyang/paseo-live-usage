@@ -35,6 +35,12 @@ const TotalsSchema = z.object({
    * store does not report it — the client then falls back to the last call.
    */
   reasoning: z.number().optional(),
+  /**
+   * User prompts / model calls counted by the store itself, for providers
+   * without per-call timing (those live on `speed.turns`/`speed.steps`).
+   */
+  turns: z.number().int().optional(),
+  steps: z.number().int().optional(),
   hitPct: z.number().nullable(),
 });
 
@@ -69,6 +75,22 @@ const DecodeFields = {
   outMs: z.number().nullable(),
 };
 
+/**
+ * The newest single call, exactly as the provider's store measured it. pi's
+ * statusline stamps every call, so its `tokensPerSecond` divides by the decode
+ * window only (no first-token wait) — that is the pill's live number.
+ */
+const LatestCallSchema = z.object({
+  ttftMs: z.number(),
+  decodeMs: z.number(),
+  output: z.number(),
+  tokensPerSecond: z.number().nullable(),
+  /** Epoch ms of the sample; null when the row carried no timestamp. */
+  at: z.number().nullable(),
+  /** That call's thinking window; null when the row carried no `thinkMs`. */
+  thinkMs: z.number().nullable(),
+});
+
 const TurnSpeedSchema = z.object({
   ...DecodeFields,
   /** dsh's turn counter; null when the provider has no such counter. */
@@ -86,6 +108,8 @@ const SpeedTotalsSchema = z.object({
   toolMs: z.number(),
   /** ttftMs ÷ samples — dsh's "首 token 平均 (TTFT)". */
   ttftAvgMs: z.number().nullable(),
+  /** Newest single call; present where the store stamps every call (pi). */
+  latest: LatestCallSchema.nullable().optional(),
 });
 
 const TimingSchema = z.object({
@@ -111,7 +135,10 @@ const SupportedSchema = z.object({
     "pi-session",
     "claude-session",
     "codex-session",
+    "grok-session",
     "devin-db",
+    "droid-session",
+    "agy-db",
     "paseo-usage",
   ]),
   observedAt: z.number(),
@@ -160,3 +187,4 @@ export type LiveUsageCost = z.infer<typeof CostSchema>;
 export type LiveUsageTiming = z.infer<typeof TimingSchema>;
 export type LiveUsageTurnSpeed = z.infer<typeof TurnSpeedSchema>;
 export type LiveUsageSpeed = z.infer<typeof SpeedTotalsSchema>;
+export type LiveUsageLatestCall = z.infer<typeof LatestCallSchema>;

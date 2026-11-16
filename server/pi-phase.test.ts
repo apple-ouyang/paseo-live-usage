@@ -112,6 +112,27 @@ test("老版本样本没有 thinkMs 字段时不算一次思考采样（未知�
   }
 });
 
+test("最新一行采样记作 latest，resume 的父链取时间上最新的一次", () => {
+  const h = newHome();
+  try {
+    const parent = h.session("parent");
+    const child = h.session("child", parent);
+    h.samples([
+      { session: "parent", t: 1_000, ttftMs: 9_000, decodeMs: 2_000, out: 1_000 },
+      { session: "child", t: 3_000, ttftMs: 14_000, decodeMs: 5_000, thinkMs: 600, outMs: 4_400, out: 700 },
+      { session: "child", t: 2_000, ttftMs: 1_000, decodeMs: 1_000, out: 10 },
+    ]);
+
+    const agg = piPhaseAggregate(h.home, child, "child");
+    assert.ok(agg);
+    // File order decides, not the row's own `t` — the samples file is append-only.
+    assert.equal(agg.latest?.output, 10);
+    assert.equal(agg.latest?.ttftMs, 1_000);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("样本文件被截断重写时不会重复累加", () => {
   const h = newHome();
   try {
@@ -127,6 +148,9 @@ test("样本文件被截断重写时不会重复累加", () => {
     const after = piPhaseAggregate(h.home, path, "trunc");
     assert.equal(after?.count, 1);
     assert.equal(after?.output, 10);
+    // The newest-call pointer resets with the sums, or it would describe a row
+    // that no longer exists.
+    assert.equal(after?.latest?.output, 10);
   } finally {
     h.cleanup();
   }

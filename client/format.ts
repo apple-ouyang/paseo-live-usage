@@ -1,3 +1,5 @@
+import type { LiveUsageResult } from "../shared/rpc.ts";
+
 export function fmtTokens(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
   if (value >= 10_000) return `${Math.round(value / 1_000)}k`;
@@ -12,9 +14,60 @@ export function fmtTps(value: number): string {
   return value >= 100 ? `${Math.round(value)}` : value.toFixed(1);
 }
 
+/**
+ * Durations in the pill: one decimal below ten seconds, whole seconds above.
+ * Same shape as `fmtSec` but never wider than `14s`.
+ */
+export function fmtTtft(ms: number): string {
+  const value = Math.max(0, ms);
+  if (value < 10_000) return `${(value / 1000).toFixed(1)}s`;
+  if (value < 60_000) return `${Math.round(value / 1000)}s`;
+  return `${Math.round(value / 60_000)}m`;
+}
+
+/**
+ * Label inside the composer pill: newest measured numbers only, one line.
+ *
+ *   `140 t/s · 首字 5.3s`
+ *
+ * The speed is the newest measured rate, in this order:
+ *   - dsh reports the open turn (`turnSpeed`);
+ *   - pi reports the last sampled call (`speed.latest`), whose denominator is the
+ *     decode window — the session file's per-request wall clock includes the
+ *     first-token wait and would show 7 t/s for a call that decoded at 140;
+ *   - a call whose decode window was too short to measure (`< MIN_SAMPLE_MS`)
+ *     falls through to the session-wide decode rate, not to the wall clock;
+ *   - providers without any decode split have one wall clock per call (`last`).
+ * Cache hit rate is deliberately NOT in the label (用户口径 2026-11-12): it keeps
+ * losing the tail to Paseo's truncation in narrow panes, and the popover shows it.
+ * Totals live there too, so the pill never grows a second line.
+ */
+export function pillLabel(data: LiveUsageResult | undefined): string {
+  if (!data) return "…";
+  if (!data.supported) return "–";
+  const parts: string[] = [];
+  // Only measured rates ever reach the label.
+  const tps =
+    data.turnSpeed?.tokensPerSecond ??
+    data.speed?.latest?.tokensPerSecond ??
+    data.speed?.tokensPerSecond ??
+    data.last?.tokensPerSecond ??
+    null;
+  if (tps !== null && tps > 0) parts.push(`${fmtTps(tps)} t/s`);
+  const ttft = data.speed?.latest?.ttftMs ?? null;
+  if (ttft !== null && Number.isFinite(ttft) && ttft > 0) parts.push(`首字 ${fmtTtft(ttft)}`);
+  if (parts.length === 0 && data.context) {
+    parts.push(`${Math.round((data.context.used / data.context.window) * 100)}% ctx`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : "–";
+}
+
 export function fmtHit(value: number | null | undefined): string | null {
   if (value === null || value === undefined || !Number.isFinite(value)) return null;
-  return value >= 99.95 ? "99.9" : value.toFixed(value >= 10 ? 0 : 1);
+  // Never round up to a "100%" that was not measured: 99.8 keeps its decimal.
+  if (value >= 99.95) return "99.9";
+  if (value >= 99) return value.toFixed(1);
+  return value >= 10 ? value.toFixed(0) : value.toFixed(1);
 }
 
 export function fmtMs(value: number | null | undefined): string {
@@ -48,7 +101,10 @@ export const SOURCE_LABELS: Record<string, string> = {
   "pi-session": "pi 会话文件",
   "claude-session": "Claude 会话文件",
   "codex-session": "Codex 会话文件",
+  "grok-session": "Grok 会话文件",
   "devin-db": "Devin CLI 会话",
+  "droid-session": "droid 会话文件",
+  "agy-db": "Antigravity 会话库",
   "paseo-usage": "Paseo lastUsage",
 };
 

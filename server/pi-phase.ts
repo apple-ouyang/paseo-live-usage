@@ -15,6 +15,20 @@ import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { readAppendedJsonl } from "./incremental-jsonl.ts";
 
+/**
+ * The newest single call the statusline sampled. The pill reads this instead of
+ * the session file's per-request wall clock: the sample's `decodeMs` excludes the
+ * first-token wait, so its TPS is the model's real decode rate.
+ */
+export interface PhaseSample {
+  /** Epoch ms the statusline stamped on the row; null on rows without `t`. */
+  t: number | null;
+  ttftMs: number;
+  decodeMs: number;
+  output: number;
+  thinkMs: number | null;
+}
+
 export interface PhaseAggregate {
   /** Σ time from request to first streamed token. */
   ttftMs: number;
@@ -33,11 +47,28 @@ export interface PhaseAggregate {
    * thinking.
    */
   thinkSamples: number;
+  /** Newest sampled call of this session (file order); null before any sample. */
+  latest: PhaseSample | null;
+  /** Fold order of `latest`, so the thread can pick the newest across sessions. */
+  latestSeq: number;
 }
 
 function emptyPhase(): PhaseAggregate {
-  return { ttftMs: 0, decodeMs: 0, thinkMs: 0, outMs: 0, output: 0, count: 0, thinkSamples: 0 };
+  return {
+    ttftMs: 0,
+    decodeMs: 0,
+    thinkMs: 0,
+    outMs: 0,
+    output: 0,
+    count: 0,
+    thinkSamples: 0,
+    latest: null,
+    latestSeq: 0,
+  };
 }
+
+/** Monotonic row counter: the samples file is append-only, so this is time order. */
+let sampleSeq = 0;
 
 /** Per-session aggregates, folded once per appended sample row. */
 const bySession = new Map<string, PhaseAggregate>();
@@ -119,6 +150,15 @@ function foldNewRows(samplesPath: string): void {
     agg.outMs += numberOr0(row.outMs);
     agg.output += numberOr0(row.out);
     agg.count += 1;
+    sampleSeq += 1;
+    agg.latestSeq = sampleSeq;
+    agg.latest = {
+      t: typeof row.t === "number" && Number.isFinite(row.t) ? row.t : null,
+      ttftMs: numberOr0(row.ttftMs),
+      decodeMs: numberOr0(row.decodeMs),
+      output: numberOr0(row.out),
+      thinkMs: typeof row.thinkMs === "number" && Number.isFinite(row.thinkMs) ? row.thinkMs : null,
+    };
   }
 }
 
@@ -149,6 +189,12 @@ export function piPhaseAggregate(home: string, sessionPath: string, sessionId: s
     const agg = bySession.get(id);
     if (!agg) continue;
     seen = true;
+    // A resumed thread spans several session files; the newest sample is the one
+    // folded last, i.e. the greatest fold counter.
+    if (agg.latest !== null && agg.latestSeq >= total.latestSeq) {
+      total.latest = agg.latest;
+      total.latestSeq = agg.latestSeq;
+    }
     total.ttftMs += agg.ttftMs;
     total.decodeMs += agg.decodeMs;
     total.thinkMs += agg.thinkMs;
