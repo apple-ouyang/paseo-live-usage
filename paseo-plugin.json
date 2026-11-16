@@ -3,5 +3,8 @@
   "description": "Live decode speed, cache-hit rate, phase timings and cost per agent, shown as a composer pill (dsh, pi, claude, codex, grok, devin, droid, antigravity-cli, plus a Paseo lastUsage fallback).",
   "requirements": {
     "paseo": ">=0.9.1 <0.17.0"
-  }
+  },
+  "media": [
+    "assets/pill.png"
+  ]
 }
